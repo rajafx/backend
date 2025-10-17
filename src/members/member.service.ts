@@ -21,7 +21,6 @@ export class MemberService {
     private readonly rewardService: RewardService,
   ) {}
 
-  // --- GET: Cek Status Member ---
   async getMemberStatus(walletAddress: string): Promise<GetMemberStatusDto> {
     const member = await this.memberRepository.findOne({
       where: { walletAddress: walletAddress.toLowerCase() },
@@ -54,7 +53,6 @@ export class MemberService {
 
     this.logger.log(`Processing new member: ${userAddress}`);
 
-    // 1. Cek apakah member sudah ada
     const existingMember = await this.memberRepository.findOne({
       where: { walletAddress: userAddress },
     });
@@ -64,36 +62,37 @@ export class MemberService {
       throw new BadRequestException('This wallet address is already registered.');
     }
 
-    // 2. Cek apakah referrer valid
-    let finalSponsor = '0x11997E4536c87A1994b944800bD0775575fCe3ea'; // Default referrer
+    const BACKEND_SIGNER_ADDRESS = (process.env.BACKEND_SIGNER_ADDRESS || '0x11997E4536c87A1994b944800bD0775575fCe3ea').toLowerCase();
+    let finalSponsor = BACKEND_SIGNER_ADDRESS;
+
     if (referrerAddressLower) {
       const referrer = await this.memberRepository.findOne({ where: { walletAddress: referrerAddressLower } });
       if (referrer) {
+        this.logger.log(`Valid referrer found: ${referrerAddressLower}. Using as sponsor.`);
         finalSponsor = referrer.walletAddress;
+      } else {
+        this.logger.warn(`Referrer ${referrerAddressLower} not found. Falling back to default developer wallet.`);
       }
+    } else {
+      this.logger.log(`No referrer provided. Using default developer wallet as sponsor.`);
     }
 
-    // 3. Cari posisi dan simpan
     const { finalSponsor: foundSponsor, finalPosition } = await this.findPlacementAndSave(
       userAddress,
       finalSponsor,
       position,
     );
 
-    // Gunakan sponsor yang ditemukan dari fungsi
     finalSponsor = foundSponsor;
 
-    // 4. Simpan struktur sponsor
     await this.saveSponsorStructure(userAddress, finalSponsor, finalPosition);
     await this.updateAllUplineCounts(finalSponsor, finalPosition);
     
-    // 5. Hitung dan berikan reward
     try {
       await this.rewardService.calculateAndAward(finalSponsor);
       this.logger.log(`Rewards calculated and awarded for sponsor: ${finalSponsor}`);
     } catch (error) {
       this.logger.error(`Failed to calculate rewards for sponsor ${finalSponsor}: ${error.message}`);
-      // Jika reward gagal, jangan gagalkan seluruh proses. Log error dan lanjutkan proses.
     }
 
     this.logger.log(`Successfully processed new member: ${userAddress} under ${finalSponsor} at ${finalPosition}`);
@@ -115,10 +114,9 @@ export class MemberService {
     
     member.expiryAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
     member.status = 'active';
-    member.currentRank = 0; // Reset rank saat renewal
+    member.currentRank = 0;
     await this.memberRepository.save(member);
     
-    // Reset status reward untuk member yang diperbarui
     await this.rewardService.resetMemberRewards(walletAddress);
     
     this.logger.log(`Member ${walletAddress} renewed successfully.`);
@@ -134,13 +132,26 @@ export class MemberService {
     newUserAddress: string,
     initialReferrerAddress: string,
     requestedPosition: 'left' | 'center' | 'right',
-  // PERBAIKAN: Mengubah tipe kembalian finalPosition dari 'string' menjadi 'left' | 'center' | 'right'
   ): Promise<{ finalSponsor: string; finalPosition: 'left' | 'center' | 'right' }> {
-    let initialReferrer = await this.memberRepository.findOne({ where: { walletAddress: initialReferrerAddress } });
+    
+    const BACKEND_SIGNER_ADDRESS = (process.env.BACKEND_SIGNER_ADDRESS || '0x11997E4536c87A1994b944800bD0775575fCe3ea').toLowerCase();
+
+    // --- LOGIKA GENESIS: Jika referrer adalah wallet dev, langsung tempatkan di bawahnya ---
+    if (initialReferrerAddress.toLowerCase() === BACKEND_SIGNER_ADDRESS) {
+      this.logger.log('🚀 Placing member under the developer (genesis) wallet.');
+      await this.saveMemberAndPlaceUnder(newUserAddress, initialReferrerAddress, requestedPosition);
+      return { finalSponsor: initialReferrerAddress, finalPosition: requestedPosition };
+    }
+
+    // --- LOGIKA NORMAL: Cari referrer di database dan lakukan spillover ---
+    const initialReferrer = await this.memberRepository.findOne({ where: { walletAddress: initialReferrerAddress } });
     if (!initialReferrer) {
+      // Seharusnya tidak terjadi karena sudah di-filter di processNewMember, tapi sebagai jaga-jaga
+      this.logger.error(`Initial referrer ${initialReferrerAddress} not found in DB. This should not happen.`);
       throw new NotFoundException(`Initial referrer ${initialReferrerAddress} not found.`);
     }
 
+    // Lakukan penempatan normal dengan logika spillover
     if (!initialReferrer[requestedPosition]) {
       await this.saveMemberAndPlaceUnder(newUserAddress, initialReferrer.walletAddress, requestedPosition);
       return { finalSponsor: initialReferrer.walletAddress, finalPosition: requestedPosition };
@@ -169,7 +180,7 @@ export class MemberService {
     }
 
     this.logger.error(`Could not find a placement for ${newUserAddress}. Placing under initial referrer as a fallback.`);
-    await this.saveMemberAndPlaceUnder(newUserAddress, initialReferrerAddress, requestedPosition);
+    await this.saveMemberAndPlaceUnder(newUserAddress, initialReferrer.walletAddress, requestedPosition);
     return { finalSponsor: initialReferrer.walletAddress, finalPosition: requestedPosition };
   }
 
